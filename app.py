@@ -3,12 +3,14 @@ from flask_cors import CORS
 from playwright.sync_api import sync_playwright
 from io import BytesIO
 import os
-import traceback  # Added for better debugging
+import traceback
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-# Use environmental variable or fallback
+# CONFIGURATION
+# If qordia.xyz is on the same server, try http://localhost:port or the Docker service name
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://qordia.xyz/login")
 
 @app.route("/", methods=["GET"])
@@ -17,48 +19,56 @@ def home():
 
 @app.route("/screenshot-dashboard", methods=["GET"])
 def screenshot_dashboard():
-    # Keep track of objects to close them in 'finally'
-    browser = None
     playwright = None
+    browser = None
     
     try:
+        # Start Playwright
         playwright = sync_playwright().start()
         
-        # Launch browser with essential Docker flags
+        # Launch Chromium with Docker-optimized flags
         browser = playwright.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-setuid-sandbox",
-                "--no-zygote",
-                "--single-process" # Helps in low-resource environments
+                "--no-zygote"
             ]
         )
 
+        # Create context with a real User-Agent to bypass bot detection
         context = browser.new_context(
             viewport={"width": 1440, "height": 1000},
-            ignore_https_errors=True # Useful if qordia.xyz has SSL issues in Docker
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ignore_https_errors=True  # Bypass SSL certificate issues
         )
         
         page = context.new_page()
 
-        # Set a reasonable default timeout for all actions
-        page.set_default_timeout(20000) 
+        # Set a generous timeout (60 seconds) for VPS environments
+        page.set_default_timeout(60000)
 
-        # Navigate - 'commit' is faster than 'load' if you just need the page to start
+        print(f"Navigating to: {DASHBOARD_URL}")
+        
+        # Navigate to the URL
+        # 'domcontentloaded' is usually enough and faster than 'networkidle'
         response = page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
         
         if not response:
-            raise Exception("Failed to load page: No response received")
+            raise Exception("No response received from the URL. Check DNS or Firewall.")
 
-        # Wait for a specific element. 'body' is too generic; 
-        # try to use a selector like '.login-card' or '#app' if possible.
-        page.wait_for_selector("body", state="visible")
+        # Wait for the body to be visible or a specific selector 
+        # (e.g. wait_for_selector(".login-form"))
+        page.wait_for_selector("body", state="visible", timeout=30000)
 
-        # Take the screenshot
+        # Optional: wait a moment for any JS animations to settle
+        time.sleep(1)
+
+        # Take full page screenshot
         screenshot_bytes = page.screenshot(full_page=True)
 
+        # Return the image
         return send_file(
             BytesIO(screenshot_bytes),
             mimetype="image/png",
@@ -67,23 +77,21 @@ def screenshot_dashboard():
         )
 
     except Exception as e:
-        # Print the error to your console/logs
-        print(f"Error occurred: {e}")
-        traceback.print_exc()
-        
+        print(f"Error caught: {e}")
         return jsonify({
             "status": "error",
             "message": str(e),
-            "traceback": traceback.format_exc() # Returns the full error to the browser
+            "traceback": traceback.format_exc()
         }), 500
 
     finally:
-        # Crucial: Ensure the browser closes even if an error occurs
+        # Crucial cleanup to prevent memory leaks and zombie processes
         if browser:
             browser.close()
         if playwright:
             playwright.stop()
 
 if __name__ == "__main__":
+    # Use PORT from environment (Coolify/Heroku/Railway) or default to 5000
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
