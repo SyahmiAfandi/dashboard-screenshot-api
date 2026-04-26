@@ -3,13 +3,13 @@ from flask_cors import CORS
 from playwright.sync_api import sync_playwright
 from io import BytesIO
 import os
-import time
+import traceback  # Added for better debugging
 
 app = Flask(__name__)
 CORS(app)
 
-# Use the internal Docker URL if possible, or ensure this is reachable
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://qordia.xyz/login")
+# Use environmental variable or fallback
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://qordia.xyz/login")
 
 @app.route("/", methods=["GET"])
 def home():
@@ -17,59 +17,73 @@ def home():
 
 @app.route("/screenshot-dashboard", methods=["GET"])
 def screenshot_dashboard():
+    # Keep track of objects to close them in 'finally'
     browser = None
+    playwright = None
+    
     try:
-        with sync_playwright() as p:
-            # Added more flags for stability in Docker/Coolify
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--no-zygote"
-                ]
-            )
+        playwright = sync_playwright().start()
+        
+        # Launch browser with essential Docker flags
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-setuid-sandbox",
+                "--no-zygote",
+                "--single-process" # Helps in low-resource environments
+            ]
+        )
 
-            # Use a single context to manage timeouts better
-            context = browser.new_context(viewport={"width": 1440, "height": 1000})
-            page = context.new_page()
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            ignore_https_errors=True # Useful if qordia.xyz has SSL issues in Docker
+        )
+        
+        page = context.new_page()
 
-            # FIX 1: Change 'networkidle' to 'load' to avoid 60s timeouts
-            # FIX 2: Added a shorter timeout for the initial navigation
-            page.goto(
-                DASHBOARD_URL, 
-                wait_until="load", 
-                timeout=30000 
-            )
+        # Set a reasonable default timeout for all actions
+        page.set_default_timeout(20000) 
 
-            # FIX 3: Instead of waiting for the whole network, 
-            # wait for a specific element that proves the dashboard loaded.
-            # Replace '.login-form' or 'body' with a selector from your app.
-            page.wait_for_selector("body", timeout=10000)
+        # Navigate - 'commit' is faster than 'load' if you just need the page to start
+        response = page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
+        
+        if not response:
+            raise Exception("Failed to load page: No response received")
 
-            # Optional: Small sleep to let animations finish
-            time.sleep(2)
+        # Wait for a specific element. 'body' is too generic; 
+        # try to use a selector like '.login-card' or '#app' if possible.
+        page.wait_for_selector("body", state="visible")
 
-            screenshot_bytes = page.screenshot(full_page=True)
-            browser.close()
+        # Take the screenshot
+        screenshot_bytes = page.screenshot(full_page=True)
 
-            return send_file(
-                BytesIO(screenshot_bytes),
-                mimetype="image/png",
-                as_attachment=False,
-                download_name="dashboard.png"
-            )
+        return send_file(
+            BytesIO(screenshot_bytes),
+            mimetype="image/png",
+            as_attachment=False,
+            download_name="dashboard.png"
+        )
 
     except Exception as e:
-        if browser:
-            browser.close()
+        # Print the error to your console/logs
+        print(f"Error occurred: {e}")
+        traceback.print_exc()
+        
         return jsonify({
             "status": "error",
-            "message": str(e)
+            "message": str(e),
+            "traceback": traceback.format_exc() # Returns the full error to the browser
         }), 500
 
+    finally:
+        # Crucial: Ensure the browser closes even if an error occurs
+        if browser:
+            browser.close()
+        if playwright:
+            playwright.stop()
+
 if __name__ == "__main__":
-    # Coolify usually passes a PORT env variable, use it if available
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
