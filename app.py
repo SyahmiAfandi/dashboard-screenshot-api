@@ -8,7 +8,7 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://160.187.210.192.nip.io/")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://160.187.210.192.nip.io/login")
 
 
 @app.route("/", methods=["GET"])
